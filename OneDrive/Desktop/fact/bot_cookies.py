@@ -50,6 +50,14 @@ SESSIONS_FILE = os.environ.get("COOKIES_SESSIONS_FILE", "proxy_sessions.json")
 
 request_times: dict[str, list[datetime]] = {}
 
+# ===============================
+# PLAYWRIGHT GLOBAL (REUSO)
+# ===============================
+# Se inicializa una sola vez en startup; el navegador NO se cierra entre requests.
+# Cada request crea un nuevo context+page (stateless) y luego se cierran.
+playwright_instance = None
+browser = None
+
 
 def _load_sessions_from_disk() -> dict:
     """Carga sesiones guardadas en disco. Descarta las expiradas."""
@@ -132,6 +140,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup():
+    global playwright_instance, browser
+    if playwright_instance and browser:
+        return
+
+    playwright_instance = await async_playwright().start()
+    browser = await playwright_instance.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-gpu",
+            "--disable-infobars",
+            "--disable-extensions",
+        ],
+    )
+    logger.info("[Startup] Playwright + Chromium iniciado ✅")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global playwright_instance, browser
+    try:
+        if browser:
+            await browser.close()
+            logger.info("[Shutdown] Chromium cerrado ✅")
+    finally:
+        browser = None
+        if playwright_instance:
+            await playwright_instance.stop()
+            logger.info("[Shutdown] Playwright detenido ✅")
+        playwright_instance = None
 
 # ===============================
 # MODELOS
@@ -1162,15 +1206,7 @@ def _clean_headers(headers: dict) -> dict:
 # PLAYWRIGHT HELPERS
 # ===============================
 
-async def _nuevo_browser(p):
-    browser = await p.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-infobars", "--disable-extensions",
-        ],
-    )
+async def _nuevo_context(browser):
     context = await browser.new_context(
         viewport={"width": 1280, "height": 720},
         locale="es-PE",
@@ -1187,7 +1223,7 @@ async def _nuevo_browser(p):
         Object.defineProperty(navigator, 'languages', { get: () => ['es-PE', 'es', 'en-US', 'en'] });
     """)
     page = await context.new_page()
-    return browser, context, page
+    return context, page
 
 
 async def _type_human(page, selector: str, text: str):
@@ -1236,10 +1272,13 @@ async def _do_login(creds: Credenciales) -> dict:
     rid = str(uuid.uuid4())[:8]
     logger.info(f"[{rid}] Login {creds.portal} | RUC={creds.ruc}")
 
-    p = browser = context = page = None
+    global browser
+    context = page = None
     try:
-        p = await async_playwright().start()
-        browser, context, page = await _nuevo_browser(p)
+        if not browser:
+            raise RuntimeError("Playwright/Chromium no inicializado (startup no ejecutado)")
+
+        context, page = await _nuevo_context(browser)
 
         if creds.portal == "declaracion":
             # Declaración y Pago:
@@ -1322,13 +1361,13 @@ async def _do_login(creds: Credenciales) -> dict:
         return {"ok": False, "error": "error_inesperado", "detalle": str(e), "request_id": rid}
 
     finally:
-        for obj, method in [(page, "close"), (context, "close"), (browser, "close"), (p, "stop")]:
+        for obj, method in [(page, "close"), (context, "close")]:
             try:
                 if obj:
                     await getattr(obj, method)()
             except:
                 pass
-        logger.info(f"[{rid}] Browser cerrado ✅")
+        logger.info(f"[{rid}] Página/Context cerrado ✅")
 
 # ===============================
 # ENDPOINTS
